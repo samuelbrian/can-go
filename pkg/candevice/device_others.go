@@ -5,6 +5,7 @@ package candevice
 import (
 	"fmt"
 	"runtime"
+	"time"
 )
 
 type NotSupportedError struct{}
@@ -40,6 +41,10 @@ func (d *Device) SetBitrate(_ uint32) error {
 }
 
 func (d *Device) SetListenOnlyMode(mode bool) error {
+	return NotSupportedError{}
+}
+
+func (d *Device) SetRestartMs(_ time.Duration) error {
 	return NotSupportedError{}
 }
 

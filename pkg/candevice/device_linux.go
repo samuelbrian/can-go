@@ -5,6 +5,7 @@ package candevice
 import (
 	"fmt"
 	"net"
+	"time"
 	"unsafe"
 
 	"github.com/mdlayher/netlink"
@@ -33,6 +34,7 @@ const (
 	sizeOfCtrlMode         = int(unsafe.Sizeof(CtrlMode{}))
 	sizeOfBusErrorCounters = int(unsafe.Sizeof(BusErrorCounters{}))
 	sizeOfStats            = int(unsafe.Sizeof(Stats{}))
+	sizeOfRestartMs        = int(unsafe.Sizeof(uint32(0)))
 )
 
 type Device struct {
@@ -49,6 +51,7 @@ type CanDevice interface {
 	SetBitrate(uint32) error
 	SetDown() error
 	SetListenOnlyMode(bool) error
+	SetRestartMs(time.Duration) error
 	SetUp() error
 }
 
@@ -238,6 +241,51 @@ func (d *Device) SetBitrate(bitrate uint32) error {
 	return nil
 }
 
+func (d *Device) SetRestartMs(restartMs time.Duration) error {
+	c, err := netlink.Dial(unix.NETLINK_ROUTE, &netlink.Config{})
+	if err != nil {
+		return fmt.Errorf("couldn't dial netlink socket: %w", err)
+	}
+	defer c.Close()
+
+	ifi := &ifInfoMsg{
+		unix.IfInfomsg{Index: d.index},
+	}
+	req, err := d.newRequest(unix.RTM_NEWLINK, ifi)
+	if err != nil {
+		return fmt.Errorf("couldn't create netlink request: %w", err)
+	}
+
+	li := &linkInfoMsg{
+		linkType: CanLinkType,
+	}
+
+	li.info, err = d.getCurrentParametersForSet()
+	if err != nil {
+		return fmt.Errorf("couldn't get current parameters: %w", err)
+	}
+
+	li.info.RestartMs = restartMs
+
+	ae := netlink.NewAttributeEncoder()
+	ae.Nested(unix.IFLA_LINKINFO, li.encode)
+	liData, err := ae.Encode()
+	if err != nil {
+		return fmt.Errorf("couldn't encode message: %w", err)
+	}
+
+	req.Data = append(req.Data, liData...)
+
+	res, err := c.Execute(req)
+	if err != nil {
+		return fmt.Errorf("couldn't set listen-only mode: %w", err)
+	}
+	if len(res) > 1 {
+		return fmt.Errorf("expected 1 message, got %d", len(res))
+	}
+	return nil
+}
+
 type Info struct {
 	BitTiming        BitTiming
 	BitTimingConst   BitTimingConst
@@ -247,7 +295,7 @@ type Info struct {
 	Type             string
 
 	State     uint32
-	RestartMs uint32
+	RestartMs time.Duration
 }
 
 func (d *Device) Info() (Info, error) {
@@ -292,7 +340,7 @@ func (d *Device) getCurrentParametersForSet() (Info, error) {
 		return Info{}, err
 	}
 
-	return Info{BitTiming: BitTiming{unix.CANBitTiming{Bitrate: i.BitTiming.Bitrate}}, CtrlMode: i.CtrlMode}, nil
+	return Info{BitTiming: BitTiming{unix.CANBitTiming{Bitrate: i.BitTiming.Bitrate}}, CtrlMode: i.CtrlMode, RestartMs: i.RestartMs}, nil
 }
 
 func (d *Device) newRequest(typ netlink.HeaderType, ifi *ifInfoMsg) (netlink.Message, error) {
@@ -504,6 +552,23 @@ func (s *Stats) unmarshalBinary(data []byte) error {
 	return nil
 }
 
+func restartMsMarshalBinary(restartMs time.Duration) []byte {
+	buf := make([]byte, sizeOfRestartMs)
+	nlenc.PutUint32(buf, uint32(restartMs.Milliseconds()))
+	return buf
+}
+
+func restartMsUnmarshalBinary(data []byte) (time.Duration, error) {
+	if len(data) != sizeOfRestartMs {
+		return 0, fmt.Errorf(
+			"data is not a valid RestartMs, expected: %d bytes, got: %d bytes",
+			sizeOfRestartMs,
+			len(data),
+		)
+	}
+	return time.Duration(nlenc.Uint32(data)) * time.Millisecond, nil
+}
+
 func (i *Info) decode(nad *netlink.AttributeDecoder) error {
 	var err error
 	for nad.Next() {
@@ -518,6 +583,8 @@ func (i *Info) decode(nad *netlink.AttributeDecoder) error {
 			err = i.CtrlMode.unmarshalBinary(nad.Bytes())
 		case unix.IFLA_CAN_BERR_COUNTER:
 			err = i.BusErrorCounters.unmarshalBinary(nad.Bytes())
+		case unix.IFLA_CAN_RESTART_MS:
+			i.RestartMs, err = restartMsUnmarshalBinary(nad.Bytes())
 		default:
 		}
 		if err != nil {
@@ -531,6 +598,7 @@ func (i *Info) decode(nad *netlink.AttributeDecoder) error {
 func (i *Info) encode(nae *netlink.AttributeEncoder) error {
 	nae.Bytes(unix.IFLA_CAN_BITTIMING, i.BitTiming.marshalBinary())
 	nae.Bytes(unix.IFLA_CAN_CTRLMODE, i.CtrlMode.marshalBinary())
+	nae.Bytes(unix.IFLA_CAN_RESTART_MS, restartMsMarshalBinary(i.RestartMs))
 	return nil
 }
 
